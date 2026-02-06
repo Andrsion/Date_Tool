@@ -1,591 +1,792 @@
-import datetime
-import re
-import requests
-import json
-import platform
-import sys
-import os
-from colorama import init, Fore, Style
-from tqdm import tqdm
-import time
-import random
+from __future__ import annotations
 
-# 初始化 colorama
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import re
+import sys
+import tempfile
+import time
+import unittest
+from enum import Enum
+from typing import Any, Callable, Final, Iterable, Mapping, MutableMapping, TypedDict
+
+from colorama import Fore, Style, init
+from jsonschema import ValidationError, validate
+import requests
+from requests.exceptions import RequestException, Timeout
+from tqdm import tqdm
+
 init(autoreset=True)
 
-# 颜色常量定义
-COLORS = {
-    'HEADER': Fore.LIGHTCYAN_EX,
-    'SUCCESS': Fore.GREEN,
-    'ERROR': Fore.RED,
-    'WARNING': Fore.YELLOW,
-    'INFO': Fore.BLUE,
-    'RESET': Style.RESET_ALL
+
+class HolidayInfo(TypedDict):
+    name: str
+    is_holiday: bool
+
+
+class Color(Enum):
+    HEADER = Fore.LIGHTCYAN_EX
+    SUCCESS = Fore.GREEN
+    ERROR = Fore.RED
+    WARNING = Fore.YELLOW
+    INFO = Fore.BLUE
+    RESET = Style.RESET_ALL
+
+
+def _c(text: str, color: Color) -> str:
+    return f"{color.value}{text}{Color.RESET.value}"
+
+
+def _is_exit_command(text: str) -> bool:
+    return text.strip().lower() in {"q", "quit", "exit"}
+
+
+if platform.system() == "Windows":
+    import msvcrt as _msvcrt
+
+    def _kbhit() -> bool:
+        return _msvcrt.kbhit()
+
+    def _getch() -> bytes:
+        return _msvcrt.getch()
+
+else:
+    import select
+    import termios
+    import tty
+
+    _termios: Any = termios
+    _tty: Any = tty
+
+    def _kbhit() -> bool:
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        return bool(readable)
+
+    def _getch() -> bytes:
+        fd = sys.stdin.fileno()
+        old_settings = _termios.tcgetattr(fd)
+        try:
+            _tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            _termios.tcsetattr(fd, _termios.TCSADRAIN, old_settings)
+        return ch.encode("utf-8", errors="ignore")
+
+
+def wait_for_any_key(prompt: str | None = None, exit_key: str = "q") -> bool:
+    if prompt:
+        print(_c(prompt, Color.INFO))
+    else:
+        print(_c(f"按任意键继续，或按'{exit_key}'退出...", Color.INFO))
+
+    if not sys.stdin.isatty():
+        try:
+            line = input()
+        except EOFError:
+            return False
+        return line.strip().lower() != exit_key.lower()
+
+    while True:
+        try:
+            hit = _kbhit()
+        except OSError:
+            hit = False
+
+        if hit:
+            key = _getch()
+            char = key.decode("utf-8", errors="ignore").lower()
+            if char == exit_key.lower() or key.lower() == b"q":
+                return False
+            return True
+        time.sleep(0.05)
+
+
+def get_input(prompt: str, *, default: str | None = None) -> str:
+    if default is None:
+        raw = input(_c(f"{prompt}: ", Color.INFO)).strip()
+    else:
+        raw = input(_c(f"{prompt}（直接回车使用{default}）: ", Color.INFO)).strip()
+        if raw == "":
+            raw = default
+    return raw
+
+
+_DATE_NUMS_RE: Final[re.Pattern[str]] = re.compile(r"\d+")
+
+
+def validate_date_input(raw: str) -> dt.date:
+    nums = _DATE_NUMS_RE.findall(raw.strip())
+    if len(nums) >= 3 and len(nums[0]) == 4:
+        year = int(nums[0])
+        month = int(nums[1])
+        day = int(nums[2])
+        if not (1900 <= year <= 2100):
+            raise ValueError("年份超出范围(1900-2100)")
+        return dt.date(year, month, day)
+
+    if len(nums) >= 2:
+        month = int(nums[0])
+        day = int(nums[1])
+        return dt.date(2000, month, day)
+
+    raise ValueError("日期格式错误")
+
+
+def validate_year(raw: str) -> int:
+    year = int(raw)
+    if not (1900 <= year <= 2100):
+        raise ValueError("年份必须在 1900-2100 之间")
+    return year
+
+
+def validate_year_range(raw: str) -> tuple[int, int]:
+    raw = raw.strip()
+    if raw == "":
+        return 2020, 2030
+    parts = raw.split("-", maxsplit=1)
+    if len(parts) == 1:
+        start = end = int(parts[0])
+    else:
+        start = int(parts[0])
+        end = int(parts[1])
+    if not (1900 <= start <= end <= 2100):
+        raise ValueError("年份必须在 1900-2100 之间，且起始不大于结束")
+    return start, end
+
+
+class HolidayAPIError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(f"Holiday API error {code}: {message}")
+        self.code = code
+        self.message = message
+
+
+_SCHEMA_API1: Final[dict[str, Any]] = {
+    "type": "object",
+    "required": ["code", "holiday"],
+    "properties": {
+        "code": {"type": "integer"},
+        "holiday": {"type": "object"},
+        "msg": {"type": "string"},
+    },
 }
 
-class DateQueryTool:
-    """具体日期查询工具"""
-    def __init__(self):
-        self.holidays = {}
-        self.current_year = None
-    
-    def get_system_time(self):
-        """获取系统当前时间"""
+_SCHEMA_API2: Final[dict[str, Any]] = {
+    "type": "object",
+    "required": ["code", "data"],
+    "properties": {
+        "code": {"type": "integer"},
+        "msg": {"type": "string"},
+        "data": {
+            "type": "object",
+            "required": ["list"],
+            "properties": {
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["date", "workday"],
+                        "properties": {
+                            "date": {"type": "integer"},
+                            "workday": {"type": "integer"},
+                            "name": {"type": "string"},
+                        },
+                    },
+                }
+            },
+        },
+    },
+}
+
+_HOLIDAY_SCHEMA: Final[dict[str, Any]] = {"oneOf": [_SCHEMA_API1, _SCHEMA_API2]}
+
+
+def _parse_downloaded_at(line: str) -> dt.datetime | None:
+    prefix = "# downloaded_at:"
+    if not line.startswith(prefix):
+        return None
+    value = line[len(prefix) :].strip()
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _now_local() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).astimezone()
+
+
+def _is_expired(downloaded_at: dt.datetime, max_age_days: int) -> bool:
+    return (_now_local() - downloaded_at) > dt.timedelta(days=max_age_days)
+
+
+class HolidayProvider:
+    COLORS: Mapping[str, Color] = {
+        "success": Color.SUCCESS,
+        "warning": Color.WARNING,
+        "info": Color.INFO,
+        "error": Color.ERROR,
+    }
+
+    def __init__(self, cache_dir: str = ".") -> None:
+        self._cache_dir = cache_dir
+        self._cache: dict[int, dict[dt.date, HolidayInfo]] = {}
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/91.0.4472.124 Safari/537.36"
+                )
+            }
+        )
+
+    def cache_path(self, year: int) -> str:
+        return os.path.join(self._cache_dir, f"holidays_{year}.json")
+
+    def clear_cache(self, year: int | None = None) -> None:
+        if year is None:
+            for name in os.listdir(self._cache_dir):
+                if name.startswith("holidays_") and name.endswith(".json"):
+                    os.remove(os.path.join(self._cache_dir, name))
+            self._cache.clear()
+            print(_c("✓ 缓存已清理", Color.SUCCESS))
+            return
+
+        path = self.cache_path(year)
+        if os.path.exists(path):
+            os.remove(path)
+        self._cache.pop(year, None)
+        print(_c(f"✓ {year} 年缓存已清理", Color.SUCCESS))
+
+    def get_holidays(
+        self, year: int, *, refresh: bool = False, max_age_days: int = 7
+    ) -> dict[dt.date, HolidayInfo]:
+        if not refresh and year in self._cache:
+            return self._cache[year]
+
+        cached, expired = self._read_cache(year, max_age_days=max_age_days)
+        if cached is not None and not refresh and not expired:
+            self._cache[year] = cached
+            return cached
+
         try:
-            now = datetime.datetime.now()
-            system_info = platform.system()
-            print(f"{COLORS['SUCCESS']}成功获取系统时间：{now.strftime('%Y年%m月%d日')} ({system_info}){COLORS['RESET']}")
-            return now.year
-        except Exception as e:
-            print(f"{COLORS['WARNING']}获取系统时间失败：{e}{COLORS['RESET']}")
-            return None
-    
-    @staticmethod
-    def validate_date_input(text):
-        """验证日期输入格式"""
-        pattern = re.compile(r'^([^\d]*)(\d{1,2})([^\d]+)(\d{1,2})([^\d]*)$')
-        match = pattern.match(text.strip())
-        if not match:
-            return False, "输入格式错误，示例：'4月5日'、'4-5'、'4.5'等"
-        
-        month = int(match.group(2))
-        day = int(match.group(4))
-        
-        if month < 1 or month > 12:
-            return False, "月份错误，应为1-12"
-        
-        if day < 1 or day > 31:
-            return False, "日期错误，应为1-31"
-            
-        return True, (month, day)
-    
-    def get_user_year(self):
-        """让用户输入年份"""
-        while True:
-            year_input = input(f"{COLORS['INFO']}请输入当前年份（如2024）: ").strip()
-            if year_input.lower() in ['q', 'quit', 'exit']:
-                return None
-            
-            try:
-                year = int(year_input)
-                if 1900 <= year <= 2100:
-                    return year
-                else:
-                    print(f"{COLORS['ERROR']}年份必须在1900-2100之间{COLORS['RESET']}")
-            except ValueError:
-                print(f"{COLORS['ERROR']}请输入有效的年份数字{COLORS['RESET']}")
-    
-    def get_cache_file(self, year):
-        """生成缓存文件名"""
-        return f'holidays_{year}.json'
-    
-    def download_holidays(self, year):
-        """下载指定年份的节假日数据"""
-        print(f"{COLORS['INFO']}正在下载{year}年节假日数据...{COLORS['RESET']}")
-        
-        # 检查本地缓存
-        cache_file = self.get_cache_file(year)
-        if os.path.exists(cache_file):
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                try:
-                    self.holidays[year] = json.load(f)
-                    print(f"{COLORS['SUCCESS']}✓ 成功加载{year}年节假日缓存数据{COLORS['RESET']}")
-                    return True
-                except json.JSONDecodeError:
-                    print(f"{COLORS['WARNING']}缓存文件损坏，重新下载{COLORS['RESET']}")
-        
-        # 使用免费的节假日API（中国）
-        urls = [
-            f"http://timor.tech/api/holiday/year/{year}",
-            f"https://api.apihubs.cn/holiday/get?year={year}&size=366",
-            f"http://api.goseek.cn/Tools/holiday?date={year}"
-        ]
-        
-        for i, url in enumerate(urls):
-            try:
-                with tqdm(total=100, desc=f"尝试API {i+1}/3", 
-                         bar_format='{desc}: {percentage:3.0f}%|{bar}| {elapsed}', leave=False) as pbar:
-                    
-                    response = requests.get(url, timeout=10)
-                    pbar.update(30)
-                    time.sleep(0.1)
-                    
-                    if response.status_code == 200:
-                        pbar.update(50)
-                        time.sleep(0.1)
-                        
-                        data = response.json()
-                        pbar.update(20)
-                        
-                        holidays = self.parse_holiday_data(data, year)
-                        if holidays:
-                            self.holidays[year] = holidays
-                            # 保存缓存
-                            with open(cache_file, 'w', encoding='utf-8') as f:
-                                json.dump(holidays, f, ensure_ascii=False, indent=2)
-                            print(f"{COLORS['SUCCESS']}✓ 成功下载{year}年节假日数据（共{len(holidays)}个节假日）{COLORS['RESET']}")
-                            return True
-                        
-            except Exception as e:
-                print(f"{COLORS['WARNING']}API {i+1} 失败：{str(e)[:50]}...{COLORS['RESET']}")
+            holidays = self._download(year)
+            self._cache[year] = holidays
+            return holidays
+        except (HolidayAPIError, ValueError, RequestException, Timeout) as exc:
+            if cached is not None:
+                print(_c(f"⚠ 使用缓存兜底：{exc}", Color.WARNING))
+                self._cache[year] = cached
+                return cached
+            raise
+
+    def parse_holiday_data(
+        self, data: Mapping[str, Any], year: int
+    ) -> dict[dt.date, HolidayInfo]:
+        code = data.get("code")
+        if code != 0:
+            msg = str(data.get("msg") or data.get("message") or "")
+            raise HolidayAPIError(int(code) if isinstance(code, int) else -1, msg)
+
+        try:
+            validate(instance=dict(data), schema=_HOLIDAY_SCHEMA)
+        except ValidationError as err:
+            path = ".".join(str(p) for p in err.path)
+            raise ValueError(f"schema 校验失败 at '{path}': {err.message}") from err
+
+        if "holiday" in data and isinstance(data["holiday"], dict):
+            return self._parse_api1(data["holiday"], year)
+
+        inner = data.get("data")
+        if isinstance(inner, dict) and isinstance(inner.get("list"), list):
+            return self._parse_api2(inner["list"], year)
+
+        raise ValueError("未知的节假日数据结构")
+
+    def _parse_api1(
+        self, holiday: Mapping[str, Any], year: int
+    ) -> dict[dt.date, HolidayInfo]:
+        result: dict[dt.date, HolidayInfo] = {}
+        for date_key, info in holiday.items():
+            if not isinstance(date_key, str):
                 continue
-        
-        print(f"{COLORS['WARNING']}无法获取在线节假日数据，将使用基础周末判断{COLORS['RESET']}")
-        self.holidays[year] = self.get_basic_holidays(year)
-        return False
-    
-    def parse_holiday_data(self, data, year):
-        """解析节假日数据"""
-        holidays = {}
-        
-        try:
-            # 适配不同API格式
-            if isinstance(data, dict):
-                if 'data' in data:
-                    holiday_data = data['data']
-                elif 'holiday' in data:
-                    holiday_data = data['holiday']
-                else:
-                    holiday_data = data
-                
-                if isinstance(holiday_data, dict):
-                    for date_str, info in holiday_data.items():
-                        try:
-                            date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-                            if date_obj.year == year:
-                                if isinstance(info, dict):
-                                    holidays[date_obj] = {
-                                        'name': info.get('name', '节假日'),
-                                        'is_holiday': info.get('holiday', True)
-                                    }
-                                else:
-                                    holidays[date_obj] = {'name': str(info), 'is_holiday': True}
-                        except:
-                            continue
-            # 特殊格式处理（如文件1的结构）
-            elif isinstance(data, list) and len(data) > 0 and 'code' in data[0]:
-                for item in data:
-                    if item.get('code') == 0:
-                        date_str = item.get('date', '')
-                        if date_str.startswith(str(year)):
-                            date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-                            holidays[date_obj] = {
-                                'name': item.get('name', '节假日'),
-                                'is_holiday': True
-                            }
-            return holidays if len(holidays) > 5 else None  # 至少要有几个节假日才算有效
-            
-        except Exception:
-            return None
-    
-    def get_basic_holidays(self, year):
-        """获取基础节假日（当API不可用时）"""
-        holidays = {}
-        basic_holidays = [
-            (1, 1, "元旦"),
-            (5, 1, "劳动节"),
-            (10, 1, "国庆节"),
-            (10, 2, "国庆节"),
-            (10, 3, "国庆节")
-        ]
-        
-        for month, day, name in basic_holidays:
-            try:
-                date_obj = datetime.date(year, month, day)
-                holidays[date_obj] = {'name': name, 'is_holiday': True}
-            except:
-                continue
-                
-        return holidays
-    
-    def get_weekday_info(self, year, month, day):
-        """获取星期几信息"""
-        try:
-            date_obj = datetime.date(year, month, day)
-            weekday = date_obj.weekday()  # 0=周一, 6=周日
-            weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-            weekday_colors = [Fore.BLUE, Fore.BLUE, Fore.BLUE, Fore.BLUE, Fore.BLUE, Fore.RED, Fore.RED]
-            
-            return {
-                'date': date_obj,
-                'weekday': weekday,
-                'weekday_name': weekday_names[weekday],
-                'weekday_color': weekday_colors[weekday],
-                'is_weekend': weekday >= 5
-            }
-        except ValueError as e:
-            return None
-    
-    def check_work_status(self, date_obj):
-        """检查工作日状态"""
-        year = date_obj.year
-        
-        # 确保有该年份的节假日数据
-        if year not in self.holidays:
-            self.download_holidays(year)
-        
-        holidays = self.holidays.get(year, {})
-        
-        # 检查是否是节假日
-        if date_obj in holidays:
-            holiday_info = holidays[date_obj]
-            return {
-                'status': '节假日',
-                'color': Fore.RED,
-                'detail': holiday_info['name']
-            }
-        
-        # 检查是否是周末
-        if date_obj.weekday() >= 5:
-            return {
-                'status': '周末',
-                'color': Fore.YELLOW,
-                'detail': '休息日'
-            }
-        
-        # 工作日
-        return {
-            'status': '工作日',
-            'color': Fore.GREEN,
-            'detail': '正常工作日'
-        }
-    
-    def format_date_info(self, year, month, day):
-        """格式化日期信息"""
-        try:
-            weekday_info = self.get_weekday_info(year, month, day)
-            if not weekday_info:
-                return f"{COLORS['ERROR']}日期无效：{year}年{month}月{day}日{COLORS['RESET']}"
-            
-            date_obj = weekday_info['date']
-            work_status = self.check_work_status(date_obj)
-            
-            # 格式化输出
-            result = f"\n{COLORS['HEADER']}{'='*50}{COLORS['RESET']}"
-            result += f"\n{COLORS['SUCCESS']}📅 具体日期查询结果{COLORS['RESET']}"
-            result += f"\n{COLORS['HEADER']}{'='*50}{COLORS['RESET']}"
-            result += f"\n{COLORS['SUCCESS']}日期：{date_obj.strftime('%Y年%m月%d日')}{COLORS['RESET']}"
-            result += f"\n{weekday_info['weekday_color']}星期：{weekday_info['weekday_name']}{COLORS['RESET']}"
-            result += f"\n{work_status['color']}状态：{work_status['status']} - {work_status['detail']}{COLORS['RESET']}"
-            
-            # 添加额外信息
-            result += f"\n{COLORS['INFO']}天数：这是{year}年的第{date_obj.timetuple().tm_yday}天{COLORS['RESET']}"
-            
-            # 节假日详情
-            if year in self.holidays and date_obj in self.holidays[year]:
-                holiday = self.holidays[year][date_obj]
-                result += f"\n{COLORS['ERROR']}节假日：{holiday['name']}{COLORS['RESET']}"
-            
-            result += f"\n{COLORS['HEADER']}{'='*50}\n{COLORS['RESET']}"
-            
-            return result
-        except Exception as e:
-            return f"{COLORS['ERROR']}格式化错误：{str(e)}{COLORS['RESET']}"
-    
-    def run(self):
-        """运行具体日期查询功能"""
-        print(f"{COLORS['HEADER']}{'='*60}{COLORS['RESET']}")
-        print(f"{COLORS['SUCCESS']}🔍 具体日期查询工具{COLORS['RESET']}")
-        print(f"{COLORS['HEADER']}{'='*60}{COLORS['RESET']}")
-        print(f"{COLORS['INFO']}功能：查询指定日期是星期几，判断是否为工作日/周末/节假日{COLORS['RESET']}")
-        print(f"{COLORS['INFO']}支持格式：4月5日、4-5、4.5、4&5、4 5等{COLORS['RESET']}")
-        print(f"{COLORS['WARNING']}退出：输入 'q'、'quit' 或 'exit' 退出程序\n{COLORS['RESET']}")
-        
-        # 获取当前年份
-        current_year = self.get_system_time()
-        if current_year is None:
-            current_year = self.get_user_year()
-            if current_year is None:
-                print(f"{COLORS['WARNING']}程序已退出{COLORS['RESET']}")
-                return
-        
-        self.current_year = current_year
-        
-        # 预下载当前年份的节假日数据
-        self.download_holidays(current_year)
-        
-        print(f"\n{COLORS['SUCCESS']}准备完成！当前基准年份：{current_year}{COLORS['RESET']}")
-        
-        while True:
-            print(f"\n{COLORS['INFO']}{'─'*50}{COLORS['RESET']}")
-            
-            # 获取年份
-            year_input = input(f"{COLORS['INFO']}请输入查询年份（直接回车使用{current_year}）: ").strip()
-            if year_input.lower() in ['q', 'quit', 'exit']:
-                break
-            
-            if year_input:
-                try:
-                    query_year = int(year_input)
-                    if not (1900 <= query_year <= 2100):
-                        print(f"{COLORS['ERROR']}年份必须在1900-2100之间{COLORS['RESET']}")
-                        continue
-                except ValueError:
-                    print(f"{COLORS['ERROR']}请输入有效的年份{COLORS['RESET']}")
-                    continue
+            if isinstance(info, dict) and isinstance(info.get("date"), str):
+                date_str = info["date"]
+            elif len(date_key) <= 5:
+                date_str = f"{year}-{date_key}"
             else:
-                query_year = current_year
-            
-            # 获取月日
-            date_input = input(f"{COLORS['INFO']}请输入月份和日期（如：4月5日、4-5、4.5等）: ").strip()
-            if date_input.lower() in ['q', 'quit', 'exit']:
-                break
-            
-            # 验证输入
-            valid, result = self.validate_date_input(date_input)
-            if not valid:
-                print(f"{COLORS['ERROR']}输入错误：{result}{COLORS['RESET']}")
+                date_str = date_key
+            try:
+                date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
                 continue
-            
-            month, day = result
-            
-            # 检查并下载该年份的节假日数据
-            if query_year not in self.holidays:
-                self.download_holidays(query_year)
-            
-            # 显示结果
-            info = self.format_date_info(query_year, month, day)
-            print(info)
-            
-            # 继续选项
-            continue_input = input(f"{COLORS['INFO']}按Enter继续查询，或输入'q'退出到主菜单: ").strip()
-            if continue_input.lower() in ['q', 'quit', 'exit']:
-                break
+            if date_obj.year != year:
+                continue
+            if isinstance(info, dict):
+                name = str(info.get("name") or "节假日")
+                is_holiday = bool(info.get("holiday", True))
+            else:
+                name = str(info)
+                is_holiday = True
+            result[date_obj] = {"name": name, "is_holiday": is_holiday}
+        if not result:
+            raise ValueError("未解析到有效节假日数据")
+        return result
+
+    def _parse_api2(
+        self, items: Iterable[Mapping[str, Any]], year: int
+    ) -> dict[dt.date, HolidayInfo]:
+        result: dict[dt.date, HolidayInfo] = {}
+        for item in items:
+            try:
+                date_int = int(item["date"])
+                workday = int(item["workday"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            try:
+                date_obj = dt.datetime.strptime(str(date_int), "%Y%m%d").date()
+            except ValueError:
+                continue
+            if date_obj.year != year:
+                continue
+            name = str(item.get("name") or "节假日")
+            result[date_obj] = {"name": name, "is_holiday": workday == 2}
+        if not result:
+            raise ValueError("未解析到有效节假日数据")
+        return result
+
+    def _download(self, year: int) -> dict[dt.date, HolidayInfo]:
+        url = f"http://timor.tech/api/holiday/year/{year}"
+        print(_c(f"正在下载 {year} 年节假日数据...", Color.INFO))
+        try:
+            resp = self._session.get(url, timeout=10, stream=True)
+        except Timeout as exc:
+            raise exc
+        except RequestException as exc:
+            raise exc
+
+        with resp:
+            resp.raise_for_status()
+            total = 0
+            try:
+                total = int(resp.headers.get("Content-Length", "0"))
+            except ValueError:
+                total = 0
+
+            if total > 0:
+                with tqdm(
+                    total=total, unit="B", unit_scale=True, desc="下载", leave=False
+                ) as bar:
+                    wrapped = tqdm.wrapattr(
+                        resp.raw, "read", total=total, callback=bar.update
+                    )
+                    content = wrapped()
+            else:
+                content = resp.content
+
+        try:
+            data = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("API 响应不是有效 JSON") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError("API 响应结构异常")
+
+        holidays = self.parse_holiday_data(data, year)
+        self._write_cache(year, holidays)
+        print(_c(f"✓ 下载成功（{len(holidays)} 条）", Color.SUCCESS))
+        return holidays
+
+    def _read_cache(
+        self, year: int, *, max_age_days: int
+    ) -> tuple[dict[dt.date, HolidayInfo] | None, bool]:
+        path = self.cache_path(year)
+        if not os.path.exists(path):
+            return None, True
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                first = f.readline()
+                downloaded_at = _parse_downloaded_at(first.strip())
+                rest = f.read()
+        except OSError:
+            return None, True
+
+        expired = True
+        json_text = rest
+
+        if downloaded_at is None:
+            json_text = first + rest
+        else:
+            expired = _is_expired(downloaded_at, max_age_days=max_age_days)
+
+        try:
+            raw = json.loads(json_text)
+        except json.JSONDecodeError:
+            return None, True
+
+        if not isinstance(raw, dict):
+            return None, True
+
+        result: dict[dt.date, HolidayInfo] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            try:
+                date_obj = dt.datetime.strptime(k, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            name_val = v.get("name")
+            is_holiday_val = v.get("is_holiday")
+            if not isinstance(name_val, str) or not isinstance(is_holiday_val, bool):
+                continue
+            result[date_obj] = {"name": name_val, "is_holiday": is_holiday_val}
+        if not result:
+            return None, True
+        return result, expired
+
+    def _write_cache(self, year: int, holidays: Mapping[dt.date, HolidayInfo]) -> None:
+        path = self.cache_path(year)
+        downloaded_at = _now_local().isoformat()
+        payload: dict[str, HolidayInfo] = {
+            d.strftime("%Y-%m-%d"): info for d, info in holidays.items()
+        }
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(f"# downloaded_at: {downloaded_at}\n")
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except OSError:
+            return
+
+
+class DateQueryTool:
+    COLORS: Mapping[str, Color] = {
+        "header": Color.HEADER,
+        "success": Color.SUCCESS,
+        "warning": Color.WARNING,
+        "info": Color.INFO,
+        "error": Color.ERROR,
+    }
+
+    def __init__(self, provider: HolidayProvider, *, refresh: bool) -> None:
+        self._provider = provider
+        self._refresh = refresh
+        self.date: dt.date | None = None
+
+    def run(self) -> None:
+        print(_c("🔍 具体日期查询工具", Color.SUCCESS))
+        print(_c("退出：输入 q/quit/exit", Color.WARNING))
+
+        current_year = dt.datetime.now().year
+        year_raw = get_input("请输入查询年份", default=str(current_year))
+        if _is_exit_command(year_raw):
+            return
+        try:
+            year = validate_year(year_raw)
+        except ValueError as exc:
+            print(_c(f"输入错误：{exc}", Color.ERROR))
+            return
+
+        self._provider.get_holidays(year, refresh=self._refresh)
+
+        while True:
+            user_raw = get_input("请输入月份和日期（如 4.5 或 4月5日）")
+            if _is_exit_command(user_raw):
+                return
+            raw = f"{year}-{user_raw}"
+            try:
+                self.date = validate_date_input(raw)
+            except ValueError as exc:
+                print(_c(f"输入错误：{exc}", Color.ERROR))
+                continue
+            print(self._format_result(self.date))
+            if not wait_for_any_key():
+                return
+
+    def _format_result(self, date_obj: dt.date) -> str:
+        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        weekday = date_obj.weekday()
+
+        holidays = self._provider.get_holidays(date_obj.year, refresh=False)
+        if date_obj in holidays:
+            info = holidays[date_obj]
+            if info["is_holiday"]:
+                status = _c("节假日", Color.ERROR)
+                detail = info["name"]
+            else:
+                status = _c("调休工作", Color.SUCCESS)
+                detail = f"{info['name']} (调休)"
+        elif weekday >= 5:
+            status = _c("周末", Color.WARNING)
+            detail = "休息日"
+        else:
+            status = _c("工作日", Color.SUCCESS)
+            detail = "正常工作日"
+
+        header = _c("=" * 50, Color.HEADER)
+        lines = [
+            "",
+            header,
+            _c(f"📅 查询结果：{date_obj:%Y-%m-%d}", Color.SUCCESS),
+            _c("-" * 50, Color.HEADER),
+            _c(f"星期：{weekday_names[weekday]}", Color.INFO),
+            f"{status}：{detail}",
+            _c(f"天数：该年第 {date_obj.timetuple().tm_yday} 天", Color.INFO),
+            header,
+            "",
+        ]
+        return "\n".join(lines)
 
 
 class WeekdayPossibilityAnalyzer:
-    """日期星期几可能性分析工具"""
-    
-    @staticmethod
-    def validate_date_input(text):
-        """验证日期输入格式"""
-        pattern = re.compile(r'^([^\d]*)(\d{1,2})([^\d]+)(\d{1,2})([^\d]*)$')
-        match = pattern.match(text.strip())
-        if not match:
-            return False, "输入格式错误，示例：'4月5日'、'4-5'、'4.5'等"
-        
-        month = int(match.group(2))
-        day = int(match.group(4))
-        
-        if month < 1 or month > 12:
-            return False, "月份错误，应为1-12"
-        
-        if day < 1 or day > 31:
-            return False, "日期错误，应为1-31"
-            
-        return True, (month, day)
-    
-    def calculate_weekday_possibilities(self, month, day, year_range=(2020, 2030)):
-        """计算某月某日在指定年份范围内可能的星期几情况"""
-        weekday_stats = {i: [] for i in range(7)}  # 0-6对应周一到周日
-        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        
-        for year in range(year_range[0], year_range[1] + 1):
+    COLORS: Mapping[str, Color] = {
+        "header": Color.HEADER,
+        "success": Color.SUCCESS,
+        "warning": Color.WARNING,
+        "info": Color.INFO,
+        "error": Color.ERROR,
+    }
+
+    def __init__(self) -> None:
+        self.date: dt.date | None = None
+
+    def run(self) -> None:
+        print(_c("📊 星期几可能性分析工具", Color.SUCCESS))
+        print(_c("退出：输入 q/quit/exit", Color.WARNING))
+
+        while True:
+            raw = get_input("请输入要分析的月日（如 4.5 或 4月5日）")
+            if _is_exit_command(raw):
+                return
             try:
-                date_obj = datetime.date(year, month, day)
-                weekday = date_obj.weekday()
-                weekday_stats[weekday].append(year)
+                self.date = validate_date_input(raw)
+            except ValueError as exc:
+                print(_c(f"输入错误：{exc}", Color.ERROR))
+                continue
+
+            range_raw = get_input(
+                "请输入分析年份范围（如 2020-2030）", default="2020-2030"
+            )
+            if _is_exit_command(range_raw):
+                return
+            try:
+                start, end = validate_year_range(range_raw)
+            except ValueError as exc:
+                print(_c(f"输入错误：{exc}", Color.ERROR))
+                continue
+            if end - start > 200:
+                end = start + 200
+                print(_c(f"范围过大，已自动调整为 {start}-{end}", Color.WARNING))
+
+            month = self.date.month
+            day = self.date.day
+            print(self._format_possibilities(month, day, start, end))
+            if not wait_for_any_key("按任意键继续分析，或按 'q' 退出..."):
+                return
+
+    def _format_possibilities(self, month: int, day: int, start: int, end: int) -> str:
+        weekday_stats: dict[int, list[int]] = {i: [] for i in range(7)}
+        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+        for year in range(start, end + 1):
+            try:
+                d = dt.date(year, month, day)
             except ValueError:
-                # 处理2月29日等无效日期
                 continue
-        
-        weekend_years = []
-        workday_years = []
-        
-        # 周末：周六(5)和周日(6)
-        weekend_years.extend(weekday_stats[5])  # 周六
-        weekend_years.extend(weekday_stats[6])  # 周日
-        
-        # 工作日：周一到周五(0-4)
-        for i in range(5):
-            workday_years.extend(weekday_stats[i])
-        
-        weekend_years.sort()
-        workday_years.sort()
-        
-        return {
-            'weekday_stats': weekday_stats,
-            'weekday_names': weekday_names,
-            'weekend_years': weekend_years,
-            'workday_years': workday_years,
-            'year_range': year_range
+            weekday_stats[d.weekday()].append(year)
+
+        weekend_years = sorted(weekday_stats[5] + weekday_stats[6])
+        workday_years = sorted(y for i in range(5) for y in weekday_stats[i])
+
+        header = _c("=" * 65, Color.HEADER)
+        lines: list[str] = [
+            "",
+            header,
+            _c(f"📊 {month}月{day}日 星期几可能性分析 ({start}-{end})", Color.SUCCESS),
+            header,
+            _c("📈 各星期几出现情况：", Color.INFO),
+        ]
+
+        for weekday, years in weekday_stats.items():
+            if not years:
+                continue
+            color = Color.WARNING if weekday >= 5 else Color.SUCCESS
+            years_str = ", ".join(str(y) for y in years[:8])
+            if len(years) > 8:
+                years_str += f" 等{len(years)}年"
+            lines.append(f"  {_c(weekday_names[weekday], color)}：{years_str}")
+
+        valid_years = len(weekend_years) + len(workday_years)
+        lines.append("")
+        lines.append(_c("📋 统计摘要：", Color.INFO))
+        lines.append(f"  分析年份范围：{end - start + 1}年")
+        lines.append(f"  有效年份数量：{valid_years}年")
+        if valid_years > 0:
+            weekend_pct = len(weekend_years) / valid_years * 100
+            workday_pct = len(workday_years) / valid_years * 100
+            lines.append(f"  周末概率：{weekend_pct:.1f}%")
+            lines.append(f"  工作日概率：{workday_pct:.1f}%")
+        lines.append(header)
+        lines.append("")
+        return "\n".join(lines)
+
+
+_COMMANDS: MutableMapping[str, Callable[[], None]] = {}
+
+
+def register_command(name: str) -> Callable[[Callable[[], None]], Callable[[], None]]:
+    def decorator(func: Callable[[], None]) -> Callable[[], None]:
+        _COMMANDS[name] = func
+        return func
+
+    return decorator
+
+
+def _show_menu() -> None:
+    print(_c("=" * 70, Color.HEADER))
+    print(_c("🗓️  日期查询工具套件", Color.SUCCESS))
+    print(_c("=" * 70, Color.HEADER))
+    print(_c("1) 查询具体日期", Color.INFO))
+    print(_c("2) 分析日期可能性", Color.INFO))
+    print(_c("3) 清理本地缓存", Color.INFO))
+    print(_c("0) 退出", Color.INFO))
+    print(_c("=" * 70, Color.HEADER))
+
+
+def _run_self_test() -> int:
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+class TestValidators(unittest.TestCase):
+    def test_month_day_valid(self) -> None:
+        d = validate_date_input("4.5")
+        self.assertEqual((d.month, d.day), (4, 5))
+
+    def test_year_month_day_valid(self) -> None:
+        d = validate_date_input("2026-01-01")
+        self.assertEqual(d, dt.date(2026, 1, 1))
+
+    def test_invalid(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_date_input("abc")
+
+    def test_edge_leap(self) -> None:
+        d = validate_date_input("2000-02-29")
+        self.assertEqual(d, dt.date(2000, 2, 29))
+
+
+class TestCache(unittest.TestCase):
+    def test_cache_header_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = HolidayProvider(cache_dir=tmp)
+            year = 2026
+            provider._write_cache(
+                year, {dt.date(2026, 1, 1): {"name": "元旦", "is_holiday": True}}
+            )
+            with open(provider.cache_path(year), "r", encoding="utf-8") as f:
+                first = f.readline().strip()
+            self.assertTrue(first.startswith("# downloaded_at: "))
+
+    def test_cache_expired_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = HolidayProvider(cache_dir=tmp)
+            year = 2026
+            provider._write_cache(
+                year, {dt.date(2026, 1, 1): {"name": "元旦", "is_holiday": True}}
+            )
+            path = provider.cache_path(year)
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            old_ts = (_now_local() - dt.timedelta(days=8)).isoformat()
+            lines[0] = f"# downloaded_at: {old_ts}\n"
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.writelines(lines)
+
+            cached, expired = provider._read_cache(year, max_age_days=7)
+            self.assertIsNotNone(cached)
+            self.assertTrue(expired)
+
+
+class TestHolidayParser(unittest.TestCase):
+    def test_api_error_code(self) -> None:
+        provider = HolidayProvider()
+        with self.assertRaises(HolidayAPIError):
+            provider.parse_holiday_data({"code": 1, "msg": "bad"}, 2026)
+
+    def test_schema_invalid(self) -> None:
+        provider = HolidayProvider()
+        with self.assertRaises(ValueError):
+            provider.parse_holiday_data({"code": 0, "holiday": []}, 2026)
+
+    def test_api1_parse(self) -> None:
+        provider = HolidayProvider()
+        data = {
+            "code": 0,
+            "holiday": {
+                "01-01": {"holiday": True, "name": "元旦", "date": "2026-01-01"}
+            },
         }
-    
-    def format_possibility_analysis(self, month, day, year_range=(2020, 2030)):
-        """格式化可能性分析结果"""
+        holidays = provider.parse_holiday_data(data, 2026)
+        self.assertIn(dt.date(2026, 1, 1), holidays)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="Date_Tool")
+    parser.add_argument("-r", "--refresh", action="store_true", help="强制刷新缓存")
+    parser.add_argument("--self-test", action="store_true", help="运行内置单元测试")
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        return _run_self_test()
+
+    provider = HolidayProvider()
+
+    @register_command("1")
+    def _cmd_query() -> None:
+        DateQueryTool(provider, refresh=args.refresh).run()
+
+    @register_command("2")
+    def _cmd_analyze() -> None:
+        WeekdayPossibilityAnalyzer().run()
+
+    @register_command("3")
+    def _cmd_clear_cache() -> None:
+        provider.clear_cache()
+        wait_for_any_key("按任意键继续...")
+
+    while True:
+        _show_menu()
+        choice = get_input("请输入功能编号", default="0")
+        if choice == "0" or _is_exit_command(choice):
+            print(_c("感谢使用！再见", Color.HEADER))
+            return 0
+        action = _COMMANDS.get(choice)
+        if action is None:
+            print(_c("无效选择，请输入 0-3", Color.ERROR))
+            wait_for_any_key("按任意键继续...")
+            continue
         try:
-            analysis = self.calculate_weekday_possibilities(month, day, year_range)
-            
-            result = f"\n{COLORS['HEADER']}{'='*65}{COLORS['RESET']}"
-            result += f"\n{COLORS['SUCCESS']}📊 {month}月{day}日 星期几可能性分析 ({year_range[0]}-{year_range[1]}){COLORS['RESET']}"
-            result += f"\n{COLORS['HEADER']}{'='*65}{COLORS['RESET']}"
-            
-            # 详细的星期分布
-            result += f"\n{COLORS['INFO']}📈 各星期几出现情况：{COLORS['RESET']}"
-            for weekday, years in analysis['weekday_stats'].items():
-                if years:
-                    weekday_name = analysis['weekday_names'][weekday]
-                    color = COLORS['WARNING'] if weekday >= 5 else COLORS['SUCCESS']
-                    years_str = ', '.join(map(str, years[:8]))  # 显示前8个年份
-                    if len(years) > 8:
-                        years_str += f" 等{len(years)}年"
-                    result += f"\n  {color}{weekday_name:<3}：{years_str}{COLORS['RESET']}"
-            
-            # 周末可能性
-            result += f"\n\n{COLORS['WARNING']}🏖️  周末可能性分析：{COLORS['RESET']}"
-            if analysis['weekend_years']:
-                result += f"\n  {COLORS['ERROR']}✓ 可能是周末：{len(analysis['weekend_years'])}个年份{COLORS['RESET']}"
-                weekend_display = ', '.join(map(str, analysis['weekend_years'][:15]))
-                if len(analysis['weekend_years']) > 15:
-                    weekend_display += f" 等{len(analysis['weekend_years'])}年"
-                result += f"\n  {COLORS['WARNING']}年份列表：{weekend_display}{COLORS['RESET']}"
-            else:
-                result += f"\n  {COLORS['INFO']}✗ 在{year_range[0]}-{year_range[1]}年间不会是周末{COLORS['RESET']}"
-            
-            # 工作日可能性
-            result += f"\n\n{COLORS['INFO']}💼 工作日可能性分析：{COLORS['RESET']}"
-            if analysis['workday_years']:
-                result += f"\n  {COLORS['SUCCESS']}✓ 可能是工作日：{len(analysis['workday_years'])}个年份{COLORS['RESET']}"
-                workday_display = ', '.join(map(str, analysis['workday_years'][:15]))
-                if len(analysis['workday_years']) > 15:
-                    workday_display += f" 等{len(analysis['workday_years'])}年"
-                result += f"\n  {COLORS['SUCCESS']}年份列表：{workday_display}{COLORS['RESET']}"
-            else:
-                result += f"\n  {COLORS['INFO']}✗ 在{year_range[0]}-{year_range[1]}年间不会是工作日{COLORS['RESET']}"
-            
-            # 统计信息
-            total_years = year_range[1] - year_range[0] + 1
-            valid_years = len(analysis['weekend_years']) + len(analysis['workday_years'])
-            result += f"\n\n{COLORS['INFO']}📋 统计摘要：{COLORS['RESET']}"
-            result += f"\n  分析年份范围：{total_years}年"
-            result += f"\n  有效年份数量：{valid_years}年"
-            if valid_years > 0:
-                weekend_pct = len(analysis['weekend_years']) / valid_years * 100
-                workday_pct = len(analysis['workday_years']) / valid_years * 100
-                result += f"\n  周末概率：{weekend_pct:.1f}%"
-                result += f"\n  工作日概率：{workday_pct:.1f}%"
-            
-            # 特殊情况说明
-            if month == 2 and day == 29:
-                result += f"\n{COLORS['WARNING']}📝 注意：2月29日仅在闰年存在（如{random.choice(analysis['workday_years'])}年）{COLORS['RESET']}"
-            
-            result += f"\n{COLORS['HEADER']}{'='*65}\n{COLORS['RESET']}"
-            return result
-            
-        except Exception as e:
-            return f"{COLORS['ERROR']}分析失败：{str(e)}{COLORS['RESET']}"
-    
-    def run(self):
-        """运行可能性分析功能"""
-        print(f"{COLORS['HEADER']}{'='*60}{COLORS['RESET']}")
-        print(f"{COLORS['SUCCESS']}📊 日期星期几可能性分析工具{COLORS['RESET']}")
-        print(f"{COLORS['HEADER']}{'='*60}{COLORS['RESET']}")
-        print(f"{COLORS['INFO']}功能：分析某月某日在不同年份中可能是周末/工作日的情况{COLORS['RESET']}")
-        print(f"{COLORS['INFO']}支持格式：4月5日、4-5、4.5、4&5、4 5等{COLORS['RESET']}")
-        print(f"{COLORS['WARNING']}退出：输入 'q'、'quit' 或 'exit' 退出程序\n{COLORS['RESET']}")
-        
-        while True:
-            print(f"\n{COLORS['INFO']}{'─'*50}{COLORS['RESET']}")
-            
-            # 获取要分析的日期
-            date_input = input(f"{COLORS['INFO']}请输入要分析的月份和日期（如：4月5日、4-5、4.5等）: ").strip()
-            if date_input.lower() in ['q', 'quit', 'exit']:
-                break
-            
-            # 验证输入
-            valid, result = self.validate_date_input(date_input)
-            if not valid:
-                print(f"{COLORS['ERROR']}输入错误：{result}{COLORS['RESET']}")
-                continue
-            
-            month, day = result
-            
-            # 获取年份范围
-            range_input = input(f"{COLORS['INFO']}请输入分析年份范围（如：2020-2030，直接回车使用2020-2030）: ").strip()
-            if range_input.lower() in ['q', 'quit', 'exit']:
-                break
-            
-            year_range = (2020, 2030)  # 默认范围
-            if range_input:
-                try:
-                    if '-' in range_input:
-                        start_year, end_year = map(int, range_input.split('-'))
-                        if 1900 <= start_year <= end_year <= 2100:
-                            if end_year - start_year > 200:
-                                print(f"{COLORS['WARNING']}年份范围过大，建议不超过200年，已自动调整为{start_year}-{start_year+200}{COLORS['RESET']}")
-                                year_range = (start_year, start_year + 200)
-                            else:
-                                year_range = (start_year, end_year)
-                        else:
-                            print(f"{COLORS['ERROR']}年份范围必须在1900-2100之间，且起始年份不能大于结束年份{COLORS['RESET']}")
-                            continue
-                    else:
-                        print(f"{COLORS['ERROR']}年份范围格式错误，应为：起始年份-结束年份{COLORS['RESET']}")
-                        continue
-                except ValueError:
-                    print(f"{COLORS['ERROR']}年份范围格式错误，请输入有效数字{COLORS['RESET']}")
-                    continue
-            
-            # 显示分析进度
-            print(f"{COLORS['INFO']}正在分析{month}月{day}日在{year_range[0]}-{year_range[1]}年的情况...{COLORS['RESET']}")
-            with tqdm(total=100, desc="分析进度", bar_format='{desc}: {percentage:3.0f}%|{bar}| {elapsed}', leave=False) as pbar:
-                pbar.update(30)
-                time.sleep(0.1)
-                
-                # 显示分析结果
-                analysis = self.format_possibility_analysis(month, day, year_range)
-                pbar.update(70)
-                time.sleep(0.1)
-            
-            print(analysis)
-            
-            # 继续选项
-            continue_input = input(f"{COLORS['INFO']}按Enter继续分析，或输入'q'退出到主菜单: ").strip()
-            if continue_input.lower() in ['q', 'quit', 'exit']:
-                break
+            action()
+        except KeyboardInterrupt:
+            print(_c("\n已退出当前操作", Color.WARNING))
+            continue
 
 
-def show_main_menu():
-    """显示主菜单"""
-    print(f"{COLORS['HEADER']}{'='*70}{COLORS['RESET']}")
-    print(f"{COLORS['SUCCESS']}               🗓️  日期查询工具套件{COLORS['RESET']}")
-    print(f"{COLORS['HEADER']}{'='*70}{COLORS['RESET']}")
-    print(f"{COLORS['INFO']}请选择您需要的功能：{COLORS['RESET']}")
-    print(f"{COLORS['SUCCESS']}  1️⃣  查询具体日期{COLORS['RESET']}")
-    print(f"{COLORS['INFO']}       查询指定年月日是星期几，判断工作日/周末/节假日状态{COLORS['RESET']}")
-    print(f"{COLORS['WARNING']}  2️⃣  分析日期可能性{COLORS['RESET']}")
-    print(f"{COLORS['INFO']}       分析某月某日在不同年份中可能是周末/工作日的情况{COLORS['RESET']}")
-    print(f"{COLORS['ERROR']}  0️⃣  退出程序{COLORS['RESET']}")
-    print(f"{COLORS['HEADER']}{'='*70}{COLORS['RESET']}")
-
-def main():
-    """主程序入口"""
+if __name__ == "__main__":
     try:
-        while True:
-            show_main_menu()
-            
-            choice = input(f"{COLORS['INFO']}请输入功能编号（0-2）: ").strip()
-            
-            if choice == '0' or choice.lower() in ['q', 'quit', 'exit']:
-                print(f"{COLORS['HEADER']}感谢使用日期查询工具！再见 👋{COLORS['RESET']}")
-                break
-            elif choice == '1':
-                # 具体日期查询
-                date_query = DateQueryTool()
-                date_query.run()
-            elif choice == '2':
-                # 可能性分析
-                analyzer = WeekdayPossibilityAnalyzer()
-                analyzer.run()
-            else:
-                print(f"{COLORS['ERROR']}无效选择，请输入 0、1 或 2{COLORS['RESET']}")
-                input(f"{COLORS['WARNING']}按Enter键继续...{COLORS['RESET']}")
-                continue
-            
+        raise SystemExit(main())
     except KeyboardInterrupt:
-        print(f"\n{COLORS['WARNING']}程序已中断{COLORS['RESET']}")
-    except Exception as e:
-        print(f"\n{COLORS['ERROR']}程序出现错误：{e}{COLORS['RESET']}")
-
-if __name__ == '__main__':
-    main()
+        print(_c("\n程序已退出", Color.WARNING))
+        raise SystemExit(0)
