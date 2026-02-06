@@ -1,0 +1,117 @@
+name: Build & Release Cross-Platform Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 仅当推送类似 v1.2.0 的 tag 时触发
+
+permissions:
+  contents: write  # 允许上传 release asset
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ["3.12"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: 🛎️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 📦 Install build dependencies (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc g++  # Ubuntu
+          # macOS 自带 clang，通常无需额外安装
+
+      - name: 📦 Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # Nuitka on Windows uses MinGW or MSVC; we'll rely on pre-installed MSVC in GitHub Actions
+          echo "MSVC should be available by default."
+
+      - name: 🔧 Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka==2.8.10  # 锁定版本，避免 CI 因新版本 break
+
+      - name: 🏗️ Build with Nuitka (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m nuitka ^
+            date_tool.py ^
+            --standalone ^
+            --onefile ^
+            --windows-icon-from-ico=date.ico ^
+            --include-package=colorama ^
+            --include-package=tqdm ^
+            --assume-yes-for-downloads ^
+            --output-filename=date_tool.exe
+        shell: cmd
+
+      - name: 🏗️ Build with Nuitka (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python -m nuitka \
+            date_tool.py \
+            --standalone \
+            --onefile \
+            --include-package=colorama \
+            --include-package=tqdm \
+            --assume-yes-for-downloads \
+            --output-filename=date_tool-linux
+
+      - name: 🏗️ Build with Nuitka (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m nuitka \
+            date_tool.py \
+            --standalone \
+            --onefile \
+            --include-package=colorama \
+            --include-package=tqdm \
+            --assume-yes-for-downloads \
+            --output-filename=date_tool-macos
+
+      - name: 📤 Upload artifact (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}
+          path: |
+            date_tool.exe
+            date_tool-linux
+            date_tool-macos
+          if-no-files-found: ignore
+
+      - name: 🏷️ Prepare release assets
+        id: prepare
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "asset_name=date_tool-windows.exe" >> $GITHUB_OUTPUT
+            cp date_tool.exe date_tool-windows.exe
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            echo "asset_name=date_tool-linux" >> $GITHUB_OUTPUT
+            chmod +x date_tool-linux
+          else
+            echo "asset_name=date_tool-macos" >> $GITHUB_OUTPUT
+            chmod +x date_tool-macos
+          fi
+
+      - name: 📤 Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.prepare.outputs.asset_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
